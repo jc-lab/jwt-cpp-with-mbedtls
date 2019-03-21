@@ -6,16 +6,13 @@
 #include <chrono>
 #include <unordered_map>
 #include <memory>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/pem.h>
-#include <openssl/ec.h>
-#include <openssl/err.h>
 
-//If openssl version less than 1.1
-#if OPENSSL_VERSION_NUMBER < 269484032
-#define OPENSSL10
-#endif
+#include <mbedtls/ecdsa.h>
+#include <mbedtls/md.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/x509.h>
+#include <mbedtls/pem.h>
+#include <mbedtls/hmac_drbg.h>
 
 #ifndef JWT_CLAIM_EXPLICIT
 #define JWT_CLAIM_EXPLICIT 0
@@ -23,6 +20,42 @@
 
 namespace jwt {
 	using date = std::chrono::system_clock::time_point;
+
+	static int myrand(void *rng_state, unsigned char *output, size_t len)
+	{
+		size_t use_len;
+		int rnd;
+
+		if (rng_state != NULL)
+			rng_state = NULL;
+
+		while (len > 0)
+		{
+			use_len = len;
+			if (use_len > sizeof(int))
+				use_len = sizeof(int);
+
+			rnd = rand();
+			memcpy(output, &rnd, use_len);
+			output += use_len;
+			len -= use_len;
+		}
+
+		return(0);
+	}
+
+	std::string generate_hash(const std::string& data, mbedtls_md_type_t md_type) {
+		mbedtls_md_context_t ctx;
+		std::string res;
+		res.resize(mbedtls_md_get_size(mbedtls_md_info_from_type(md_type)));
+		mbedtls_md_init(&ctx);
+		mbedtls_md_init_ctx(&ctx, mbedtls_md_info_from_type(md_type));
+		mbedtls_md_starts(&ctx);
+		mbedtls_md_update(&ctx, (const unsigned char *)data.data(), data.size());
+		mbedtls_md_finish(&ctx, (unsigned char*)res.data());
+		mbedtls_md_free(&ctx);
+		return res;
+	}
 
 	struct signature_verification_exception : public std::runtime_error {
 		signature_verification_exception()
@@ -71,6 +104,36 @@ namespace jwt {
 		{}
 	};
 
+	class random {
+	public:
+		mbedtls_hmac_drbg_context hmac_drbg;
+
+	public:
+		random() {
+			std::string sig;
+			int ret_write_sign;
+			mbedtls_mpi r;
+			mbedtls_mpi s;
+			mbedtls_mpi_init(&r);
+			mbedtls_mpi_init(&s);
+			mbedtls_hmac_drbg_init(&hmac_drbg);
+			mbedtls_hmac_drbg_seed(&hmac_drbg, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), myrand, NULL, NULL, 0);
+		}
+
+		virtual ~random()
+		{
+			mbedtls_hmac_drbg_free(&hmac_drbg);
+		}
+
+		void *random_context() {
+			return &hmac_drbg;
+		}
+
+		static int static_random(void *p, unsigned char *b, size_t s) {
+			return mbedtls_hmac_drbg_random(p, b, s);
+		}
+	};
+
 	namespace algorithm {
 		/**
 		 * "none" algorithm.
@@ -102,8 +165,8 @@ namespace jwt {
 			 * \param md Pointer to hash function
 			 * \param name Name of the algorithm
 			 */
-			hmacsha(std::string key, const EVP_MD*(*md)(), const std::string& name)
-				: secret(std::move(key)), md(md), alg_name(name)
+			hmacsha(std::string key, const mbedtls_md_type_t md_type, const std::string& name)
+				: secret(std::move(key)), md_type(md_type), alg_name(name)
 			{}
 			/**
 			 * Sign jwt data
@@ -112,12 +175,15 @@ namespace jwt {
 			 * \throws signature_generation_exception
 			 */
 			std::string sign(const std::string& data) const {
+				mbedtls_md_context_t ctx;
 				std::string res;
-				res.resize(EVP_MAX_MD_SIZE);
-				unsigned int len = res.size();
-				if (HMAC(md(), secret.data(), secret.size(), (const unsigned char*)data.data(), data.size(), (unsigned char*)res.data(), &len) == nullptr)
-					throw signature_generation_exception();
-				res.resize(len);
+				res.resize(mbedtls_md_get_size(mbedtls_md_info_from_type(md_type)));
+				mbedtls_md_init(&ctx);
+				mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 1); //use hmac
+				mbedtls_md_hmac_starts(&ctx, (const unsigned char*)secret.c_str(), secret.length());
+				mbedtls_md_hmac_update(&ctx, (const unsigned char *)data.data(), data.size());
+				mbedtls_md_hmac_finish(&ctx, (unsigned char*)res.data());
+				mbedtls_md_free(&ctx);
 				return res;
 			}
 			/**
@@ -153,10 +219,11 @@ namespace jwt {
 			/// HMAC secrect
 			const std::string secret;
 			/// HMAC hash generator
-			const EVP_MD*(*md)();
+			const mbedtls_md_type_t md_type;
 			/// Algorithmname
 			const std::string alg_name;
 		};
+#if 0
 		/**
 		 * Base class for RSA family of algorithms
 		 */
@@ -170,28 +237,15 @@ namespace jwt {
 			 * \param md Pointer to hash function
 			 * \param name Name of the algorithm
 			 */
-			rsa(const std::string& public_key, const std::string& private_key, const std::string& public_key_password, const std::string& private_key_password, const EVP_MD*(*md)(), const std::string& name)
-				: md(md), alg_name(name)
+			rsa(const std::string& public_key, const std::string& private_key, const std::string& public_key_password, const std::string& private_key_password, const mbedtls_md_type_t md_type, const std::string& name)
+				: md_type(md_type), alg_name(name)
 			{
-				std::unique_ptr<BIO, decltype(&BIO_free_all)> pubkey_bio(BIO_new(BIO_s_mem()), BIO_free_all);
-				if ((size_t)BIO_write(pubkey_bio.get(), public_key.data(), public_key.size()) != public_key.size())
-					throw rsa_exception("failed to load public key: bio_write failed");
-				pkey.reset(PEM_read_bio_PUBKEY(pubkey_bio.get(), nullptr, nullptr, (void*)public_key_password.c_str()), EVP_PKEY_free);
-				if (!pkey)
-					throw rsa_exception("failed to load public key: PEM_read_bio_PUBKEY failed");
+				mbedtls_rsa_init(&rsa_ctx, MBEDTLS_RSA_PKCS_V15, md_type);
+				mbedtls_rsa_
+			}
 
-				if (!private_key.empty()) {
-					std::unique_ptr<BIO, decltype(&BIO_free_all)> privkey_bio(BIO_new(BIO_s_mem()), BIO_free_all);
-					if ((size_t)BIO_write(privkey_bio.get(), private_key.data(), private_key.size()) != private_key.size())
-						throw rsa_exception("failed to load private key: bio_write failed");
-					RSA* privkey = PEM_read_bio_RSAPrivateKey(privkey_bio.get(), nullptr, nullptr, (void*)private_key_password.c_str());
-					if (privkey == nullptr)
-						throw rsa_exception("failed to load private key: PEM_read_bio_RSAPrivateKey failed");
-					if (EVP_PKEY_assign_RSA(pkey.get(), privkey) == 0) {
-						RSA_free(privkey);
-						throw rsa_exception("failed to load private key: EVP_PKEY_assign_RSA failed");
-					}
-				}
+			virtual ~rsa() {
+				mbedtls_rsa_free(&rsa_ctx);
 			}
 			/**
 			 * Sign jwt data
@@ -199,27 +253,12 @@ namespace jwt {
 			 * \return RSA signature for the given data
 			 * \throws signature_generation_exception
 			 */
-			std::string sign(const std::string& data) const {
-#ifdef OPENSSL10
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_destroy)> ctx(EVP_MD_CTX_create(), EVP_MD_CTX_destroy);
-#else
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_create(), EVP_MD_CTX_free);
-#endif
-				if (!ctx)
-					throw signature_generation_exception("failed to create signature: could not create context");
-				if (!EVP_SignInit(ctx.get(), md()))
-					throw signature_generation_exception("failed to create signature: SignInit failed");
-
+			std::string sign(const std::string& data) {
+				std::string hash = generate_hash(data, md_type);
 				std::string res;
-				res.resize(EVP_PKEY_size(pkey.get()));
-				unsigned int len = 0;
-
-				if (!EVP_SignUpdate(ctx.get(), data.data(), data.size()))
-					throw signature_generation_exception();
-				if (!EVP_SignFinal(ctx.get(), (unsigned char*)res.data(), &len, pkey.get()))
-					throw signature_generation_exception();
-
-				res.resize(len);
+				int rc;
+				res.resize(mbedtls_rsa_get_len(&rsa_ctx));
+				rc = mbedtls_rsa_pkcs1_sign(&rsa_ctx, rnd.static_random, rnd.random_context(), MBEDTLS_RSA_PRIVATE, md_type, hash.length(), (const unsigned char*)hash.data(), (unsigned char*)res.data());
 				return res;
 			}
 			/**
@@ -228,20 +267,13 @@ namespace jwt {
 			 * \param signature Signature provided by the jwt
 			 * \throws signature_verification_exception If the provided signature does not match
 			 */
-			void verify(const std::string& data, const std::string& signature) const {
-#ifdef OPENSSL10
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_destroy)> ctx(EVP_MD_CTX_create(), EVP_MD_CTX_destroy);
-#else
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_create(), EVP_MD_CTX_free);
-#endif
-				if (!ctx)
-					throw signature_verification_exception("failed to verify signature: could not create context");
-				if (!EVP_VerifyInit(ctx.get(), md()))
-					throw signature_verification_exception("failed to verify signature: VerifyInit failed");
-				if (!EVP_VerifyUpdate(ctx.get(), data.data(), data.size()))
-					throw signature_verification_exception("failed to verify signature: VerifyUpdate failed");
-				if (!EVP_VerifyFinal(ctx.get(), (const unsigned char*)signature.data(), signature.size(), pkey.get()))
+			void verify(const std::string& data, const std::string& signature) {
+				std::string hash = generate_hash(data, md_type);
+				int rc = mbedtls_rsa_pkcs1_verify(&rsa_ctx, rnd.static_random, rnd.random_context(), MBEDTLS_RSA_PUBLIC, MBEDTLS_MD_NONE, hash.length(), (const unsigned char*)hash.data(), (const unsigned char*)signature.data());
+				if (rc != 0)
+				{
 					throw signature_verification_exception();
+				}
 			}
 			/**
 			 * Returns the algorithm name provided to the constructor
@@ -251,17 +283,27 @@ namespace jwt {
 				return alg_name;
 			}
 		private:
-			/// OpenSSL structure containing converted keys
-			std::shared_ptr<EVP_PKEY> pkey;
+			random rnd;
+
+			mbedtls_rsa_context rsa_ctx;
+
 			/// Hash generator
-			const EVP_MD*(*md)();
+			const mbedtls_md_type_t md_type;
 			/// Algorithmname
 			const std::string alg_name;
 		};
+#endif
 		/**
 		 * Base class for ECDSA family of algorithms
 		 */
 		struct ecdsa {
+			ecdsa(const mbedtls_ecp_keypair *keypair, const mbedtls_md_type_t md_type, const std::string& name)
+				: md_type(md_type), alg_name(name)
+			{
+				mbedtls_ecdsa_init(&ecdsa_ctx);
+				mbedtls_ecdsa_from_keypair(&ecdsa_ctx, keypair);
+			}
+#if 0
 			/**
 			 * Construct new ecdsa algorithm
 			 * \param public_key ECDSA public key in PEM format
@@ -294,28 +336,41 @@ namespace jwt {
 				if(EC_KEY_check_key(pkey.get()) == 0)
 					throw ecdsa_exception("failed to load key: key is invalid");
 			}
+#endif
+
+			virtual ~ecdsa()
+			{
+				mbedtls_ecdsa_free(&ecdsa_ctx);
+			}
+
 			/**
 			 * Sign jwt data
 			 * \param data The data to sign
 			 * \return ECDSA signature for the given data
 			 * \throws signature_generation_exception
 			 */
-			std::string sign(const std::string& data) const {
-				const std::string hash = generate_hash(data);
+			std::string sign(const std::string& data) {
+				const std::string hash = generate_hash(data, md_type);
+				std::string sig;
+				int ret_write_sign;
+				mbedtls_mpi r;
+				mbedtls_mpi s;
+				mbedtls_mpi_init(&r);
+				mbedtls_mpi_init(&s);
+				ret_write_sign = mbedtls_ecdsa_sign(&ecdsa_ctx.grp, &r, &s, &ecdsa_ctx.d, (const unsigned char*)hash.data(), hash.size() * 8, rnd.static_random, rnd.random_context());
+				
+				raw2bn(&r, (unsigned char*)sig.data(), sig.size() / 2);
+				raw2bn(&r, (unsigned char*)sig.data() + (sig.size() / 2), sig.size() / 2);
 
-				std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)>
-					sig(ECDSA_do_sign((const unsigned char*)hash.data(), hash.size(), pkey.get()), ECDSA_SIG_free);
-				if(!sig)
+				mbedtls_mpi_free(&r);
+				mbedtls_mpi_free(&s);
+
+				if(ret_write_sign)
 					throw signature_generation_exception();
-#ifdef OPENSSL10
 
-				return bn2raw(sig->r) + bn2raw(sig->s);
-#else
-				const BIGNUM *r;
-				const BIGNUM *s;
-				ECDSA_SIG_get0(sig.get(), &r, &s);
-				return bn2raw(r) + bn2raw(s);
-#endif
+				if (sig.size() % 2 == 1 && sig[0] == 0x00)
+					return sig.substr(1);
+				return sig;
 			}
 			/**
 			 * Check if signature is valid
@@ -323,26 +378,26 @@ namespace jwt {
 			 * \param signature Signature provided by the jwt
 			 * \throws signature_verification_exception If the provided signature does not match
 			 */
-			void verify(const std::string& data, const std::string& signature) const {
-				const std::string hash = generate_hash(data);
-				auto r = raw2bn(signature.substr(0, signature.size() / 2));
-				auto s = raw2bn(signature.substr(signature.size() / 2));
+			void verify(const std::string& data, const std::string& signature) {
+				const std::string hash = generate_hash(data, md_type);
+				int ret_read_sign;
+				mbedtls_mpi r;
+				mbedtls_mpi s;
 
-#ifdef OPENSSL10
-				ECDSA_SIG sig;
-				sig.r = r.get();
-				sig.s = s.get();
+				mbedtls_mpi_init(&r);
+				mbedtls_mpi_init(&s);
+				raw2bn(&r, (const unsigned char*)signature.data(), signature.size() / 2);
+				raw2bn(&s, (const unsigned char*)signature.data() + (signature.size() / 2), signature.size() / 2);
 
-				if(ECDSA_do_verify((const unsigned char*)hash.data(), hash.size(), &sig, pkey.get()) != 1)
+				ret_read_sign = mbedtls_ecdsa_verify(&ecdsa_ctx.grp, (const unsigned char*)hash.data(), hash.size() * 8, &ecdsa_ctx.Q, &r, &s);
+
+				mbedtls_mpi_free(&r);
+				mbedtls_mpi_free(&s);
+
+				if (ret_read_sign)
+				{
 					throw signature_verification_exception("Invalid signature");
-#else
-				ECDSA_SIG *sig = ECDSA_SIG_new();
-
-				ECDSA_SIG_set0(sig, r.get(), s.get());
-
-				if(ECDSA_do_verify((const unsigned char*)hash.data(), hash.size(), sig, pkey.get()) != 1)
-					throw signature_verification_exception("Invalid signature");
-#endif
+				}
 			}
 			/**
 			 * Returns the algorithm name provided to the constructor
@@ -352,70 +407,26 @@ namespace jwt {
 				return alg_name;
 			}
 		private:
-			/**
-			 * Convert a OpenSSL BIGNUM to a std::string
-			 * \param bn BIGNUM to convert
-			 * \return bignum as string
-			 */
-#ifdef OPENSSL10
-			static std::string bn2raw(BIGNUM* bn)
-#else
-			static std::string bn2raw(const BIGNUM* bn)
-#endif
-			{
-				std::string res;
-				res.resize(BN_num_bytes(bn));
-				BN_bn2bin(bn, (unsigned char*)res.data());
-				if(res.size()%2 == 1 && res[0] == 0x00)
-					return res.substr(1);
-				return res;
-			}
-			/**
-			 * Convert an std::string to a OpenSSL BIGNUM
-			 * \param raw String to convert
-			 * \return BIGNUM representation
-			 */
-			static std::unique_ptr<BIGNUM, decltype(&BN_free)> raw2bn(const std::string& raw) {
-				if(static_cast<uint8_t>(raw[0]) >= 0x80) {
-					std::string str(1, 0x00);
-					str += raw;
-					return std::unique_ptr<BIGNUM, decltype(&BN_free)>(BN_bin2bn((const unsigned char*)str.data(), str.size(), nullptr), BN_free);
-				}
-				return std::unique_ptr<BIGNUM, decltype(&BN_free)>(BN_bin2bn((const unsigned char*)raw.data(), raw.size(), nullptr), BN_free);
-			}
+			random rnd;
+			mbedtls_md_type_t md_type;
+			mbedtls_ecdsa_context ecdsa_ctx;
 
-			/**
-			 * Hash the provided data using the hash function specified in constructor
-			 * \param data Data to hash
-			 * \return Hash of data
-			 */
-			std::string generate_hash(const std::string& data) const {
-#ifdef OPENSSL10
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_destroy)> ctx(EVP_MD_CTX_create(), &EVP_MD_CTX_destroy);
-#else
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-#endif
-				if(EVP_DigestInit(ctx.get(), md()) == 0)
-					throw signature_generation_exception("EVP_DigestInit failed");
-				if(EVP_DigestUpdate(ctx.get(), data.data(), data.size()) == 0)
-					throw signature_generation_exception("EVP_DigestUpdate failed");
-				unsigned int len = 0;
-				std::string res;
-				res.resize(EVP_MD_CTX_size(ctx.get()));
-				if(EVP_DigestFinal(ctx.get(), (unsigned char*)res.data(), &len) == 0)
-					throw signature_generation_exception("EVP_DigestFinal failed");
-				res.resize(len);
-				return res;
-			}
-
-			/// OpenSSL struct containing keys
-			std::shared_ptr<EC_KEY> pkey;
-			/// Hash generator function
-			const EVP_MD*(*md)();
 			/// Algorithmname
 			const std::string alg_name;
+
+			int raw2bn(mbedtls_mpi *x, const unsigned char *data, size_t size)
+			{
+				if (data[0] >= 0x80)
+				{
+					std::string temp(1, 0x00);
+					temp.append((const char*)data, size);
+					return mbedtls_mpi_read_binary(x, (const unsigned char*)temp.data(), temp.size());
+				}
+				return mbedtls_mpi_read_binary(x, data, size);
+			}
 		};
 
+#if 0
 		/**
 		 * Base class for PSS-RSA family of algorithms
 		 */
@@ -531,6 +542,7 @@ namespace jwt {
 			/// Algorithmname
 			const std::string alg_name;
 		};
+#endif
 
 		/**
 		 * HS256 algorithm
@@ -541,7 +553,7 @@ namespace jwt {
 			 * \param key HMAC signing key
 			 */
 			explicit hs256(std::string key)
-				: hmacsha(std::move(key), EVP_sha256, "HS256")
+				: hmacsha(std::move(key), MBEDTLS_MD_SHA256, "HS256")
 			{}
 		};
 		/**
@@ -553,7 +565,7 @@ namespace jwt {
 			 * \param key HMAC signing key
 			 */
 			explicit hs384(std::string key)
-				: hmacsha(std::move(key), EVP_sha384, "HS384")
+				: hmacsha(std::move(key), MBEDTLS_MD_SHA384, "HS384")
 			{}
 		};
 		/**
@@ -565,9 +577,10 @@ namespace jwt {
 			 * \param key HMAC signing key
 			 */
 			explicit hs512(std::string key)
-				: hmacsha(std::move(key), EVP_sha512, "HS512")
+				: hmacsha(std::move(key), MBEDTLS_MD_SHA512, "HS512")
 			{}
 		};
+#if 0
 		/**
 		 * RS256 algorithm
 		 */
@@ -613,10 +626,12 @@ namespace jwt {
 				: rsa(public_key, private_key, public_key_password, private_key_password, EVP_sha512, "RS512")
 			{}
 		};
+#endif
 		/**
 		 * ES256 algorithm
 		 */
 		struct es256 : public ecdsa {
+#if 0
 			/**
 			 * Construct new instance of algorithm
 			 * \param public_key ECDSA public key in PEM format
@@ -627,11 +642,16 @@ namespace jwt {
 			es256(const std::string& public_key, const std::string& private_key = "", const std::string& public_key_password = "", const std::string& private_key_password = "")
 				: ecdsa(public_key, private_key, public_key_password, private_key_password, EVP_sha256, "ES256")
 			{}
+#endif
+			es256(const mbedtls_ecp_keypair *keypair)
+				: ecdsa(keypair, MBEDTLS_MD_SHA256, "ES256")
+			{}
 		};
 		/**
 		 * ES384 algorithm
 		 */
 		struct es384 : public ecdsa {
+#if 0
 			/**
 			 * Construct new instance of algorithm
 			 * \param public_key ECDSA public key in PEM format
@@ -642,11 +662,16 @@ namespace jwt {
 			es384(const std::string& public_key, const std::string& private_key = "", const std::string& public_key_password = "", const std::string& private_key_password = "")
 				: ecdsa(public_key, private_key, public_key_password, private_key_password, EVP_sha384, "ES384")
 			{}
+#endif
+			es384(const mbedtls_ecp_keypair *keypair)
+				: ecdsa(keypair, MBEDTLS_MD_SHA384, "ES384")
+			{}
 		};
 		/**
 		 * ES512 algorithm
 		 */
 		struct es512 : public ecdsa {
+#if 0
 			/**
 			 * Construct new instance of algorithm
 			 * \param public_key ECDSA public key in PEM format
@@ -657,8 +682,13 @@ namespace jwt {
 			es512(const std::string& public_key, const std::string& private_key = "", const std::string& public_key_password = "", const std::string& private_key_password = "")
 				: ecdsa(public_key, private_key, public_key_password, private_key_password, EVP_sha512, "ES512")
 			{}
+#endif
+			es512(const mbedtls_ecp_keypair *keypair)
+				: ecdsa(keypair, MBEDTLS_MD_SHA512, "ES512")
+			{}
 		};
 
+#if 0
 		/**
 		 * PS256 algorithm
 		 */
@@ -704,6 +734,7 @@ namespace jwt {
 				: pss(public_key, private_key, public_key_password, private_key_password, EVP_sha512, "PS512")
 			{}
 		};
+#endif
 	}
 
 	/**
@@ -1092,21 +1123,21 @@ namespace jwt {
 				switch (str.size() % 4) {
 				case 1:
 					str += alphabet::base64url::fill();
-#ifdef __cpp_attributes
+#if defined(__cpp_attributes) && defined(__has_cpp_attribute)
 #if __has_cpp_attribute(fallthrough)
 					[[fallthrough]];
 #endif
 #endif
 				case 2:
 					str += alphabet::base64url::fill();
-#ifdef __cpp_attributes
+#if defined(__cpp_attributes) && defined(__has_cpp_attribute)
 #if __has_cpp_attribute(fallthrough)
 					[[fallthrough]];
 #endif
 #endif
 				case 3:
 					str += alphabet::base64url::fill();
-#ifdef __cpp_attributes  
+#if defined(__cpp_attributes) && defined(__has_cpp_attribute)
 #if __has_cpp_attribute(fallthrough)
 					[[fallthrough]];
 #endif
