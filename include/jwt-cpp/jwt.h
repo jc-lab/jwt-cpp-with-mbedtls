@@ -105,9 +105,11 @@ namespace jwt {
 	};
 
 	class random {
-	public:
+	private:
 		mbedtls_hmac_drbg_context hmac_drbg;
 
+		random(random &o) {}
+		random(const random &o) {}
 	public:
 		random() {
 			std::string sig;
@@ -297,11 +299,31 @@ namespace jwt {
 		 * Base class for ECDSA family of algorithms
 		 */
 		struct ecdsa {
-			ecdsa(const mbedtls_ecp_keypair *keypair, const mbedtls_md_type_t md_type, const std::string& name)
-				: md_type(md_type), alg_name(name)
+			struct impl {
+				random rnd;
+				mbedtls_md_type_t md_type;
+				mbedtls_ecdsa_context ecdsa_ctx;
+
+				/// Algorithmname
+				const std::string alg_name;
+
+				impl(const mbedtls_ecp_keypair *keypair, const mbedtls_md_type_t md_type, const std::string& name)
+					: md_type(md_type), alg_name(name)
+				{
+					mbedtls_ecdsa_init(&ecdsa_ctx);
+					mbedtls_ecdsa_from_keypair(&ecdsa_ctx, keypair);
+				}
+
+				~impl() {
+					mbedtls_ecdsa_free(&ecdsa_ctx);
+				}
+			};
+
+			std::shared_ptr<impl> _impl;
+
+			ecdsa(const mbedtls_ecp_keypair *keypair, const mbedtls_md_type_t md_type, const std::string& name) : 
+				_impl(new impl(keypair, md_type, name))
 			{
-				mbedtls_ecdsa_init(&ecdsa_ctx);
-				mbedtls_ecdsa_from_keypair(&ecdsa_ctx, keypair);
 			}
 #if 0
 			/**
@@ -338,11 +360,6 @@ namespace jwt {
 			}
 #endif
 
-			virtual ~ecdsa()
-			{
-				mbedtls_ecdsa_free(&ecdsa_ctx);
-			}
-
 			/**
 			 * Sign jwt data
 			 * \param data The data to sign
@@ -350,14 +367,14 @@ namespace jwt {
 			 * \throws signature_generation_exception
 			 */
 			std::string sign(const std::string& data) {
-				const std::string hash = generate_hash(data, md_type);
+				const std::string hash = generate_hash(data, _impl->md_type);
 				std::string sig;
 				int ret_write_sign;
 				mbedtls_mpi r;
 				mbedtls_mpi s;
 				mbedtls_mpi_init(&r);
 				mbedtls_mpi_init(&s);
-				ret_write_sign = mbedtls_ecdsa_sign(&ecdsa_ctx.grp, &r, &s, &ecdsa_ctx.d, (const unsigned char*)hash.data(), hash.size() * 8, rnd.static_random, rnd.random_context());
+				ret_write_sign = mbedtls_ecdsa_sign(&_impl->ecdsa_ctx.grp, &r, &s, &_impl->ecdsa_ctx.d, (const unsigned char*)hash.data(), hash.size() * 8, _impl->rnd.static_random, _impl->rnd.random_context());
 				
 				raw2bn(&r, (unsigned char*)sig.data(), sig.size() / 2);
 				raw2bn(&r, (unsigned char*)sig.data() + (sig.size() / 2), sig.size() / 2);
@@ -379,7 +396,7 @@ namespace jwt {
 			 * \throws signature_verification_exception If the provided signature does not match
 			 */
 			void verify(const std::string& data, const std::string& signature) {
-				const std::string hash = generate_hash(data, md_type);
+				const std::string hash = generate_hash(data, _impl->md_type);
 				int ret_read_sign;
 				mbedtls_mpi r;
 				mbedtls_mpi s;
@@ -389,7 +406,7 @@ namespace jwt {
 				raw2bn(&r, (const unsigned char*)signature.data(), signature.size() / 2);
 				raw2bn(&s, (const unsigned char*)signature.data() + (signature.size() / 2), signature.size() / 2);
 
-				ret_read_sign = mbedtls_ecdsa_verify(&ecdsa_ctx.grp, (const unsigned char*)hash.data(), hash.size() * 8, &ecdsa_ctx.Q, &r, &s);
+				ret_read_sign = mbedtls_ecdsa_verify(&_impl->ecdsa_ctx.grp, (const unsigned char*)hash.data(), hash.size() * 8, &_impl->ecdsa_ctx.Q, &r, &s);
 
 				mbedtls_mpi_free(&r);
 				mbedtls_mpi_free(&s);
@@ -404,16 +421,9 @@ namespace jwt {
 			 * \return Algorithmname
 			 */
 			std::string name() const {
-				return alg_name;
+				return _impl->alg_name;
 			}
 		private:
-			random rnd;
-			mbedtls_md_type_t md_type;
-			mbedtls_ecdsa_context ecdsa_ctx;
-
-			/// Algorithmname
-			const std::string alg_name;
-
 			int raw2bn(mbedtls_mpi *x, const unsigned char *data, size_t size)
 			{
 				if (data[0] >= 0x80)
