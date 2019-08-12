@@ -44,7 +44,7 @@ namespace jwt {
 		return(0);
 	}
 
-	std::string generate_hash(const std::string& data, mbedtls_md_type_t md_type) {
+	static std::string generate_hash(const std::string& data, mbedtls_md_type_t md_type) {
 		mbedtls_md_context_t ctx;
 		std::string res;
 		res.resize(mbedtls_md_get_size(mbedtls_md_info_from_type(md_type)));
